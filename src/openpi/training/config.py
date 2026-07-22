@@ -710,13 +710,17 @@ _CONFIGS = [
         # you see many warnings being thrown during training.
         model=pi0_fast.Pi0FASTConfig(action_dim=7, action_horizon=10, max_token_len=180),
         data=LeRobotLiberoDataConfig(
-            repo_id="physical-intelligence/libero",
+            # repo_id="ryanhoangt/libero-icl-finetune",
+            # repo_id="ryanhoangt/libero-90",
+            repo_id="ryanhoangt/libero-icl-finetune-plus-90",
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=True,
         ),
         # Note that we load the pi0-FAST base model checkpoint here.
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
-        num_train_steps=30_000,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/mnt/data/vhoangth2/pretrained-weights/pi0_fast_base/params"),
+        num_train_steps=60_000,
+        # wandb_enabled=False,
+        save_interval=20_000,
     ),
     TrainConfig(
         name="pi0_fast_libero_low_mem_finetune",
@@ -726,12 +730,12 @@ _CONFIGS = [
             action_dim=7, action_horizon=10, max_token_len=180, paligemma_variant="gemma_2b_lora"
         ),
         data=LeRobotLiberoDataConfig(
-            repo_id="physical-intelligence/libero",
+            repo_id="ryanhoangt/libero-icl-finetune",
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=True,
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
-        num_train_steps=30_000,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/mnt/data/vhoangth2/pretrained-weights/pi0_fast_base/params"),
+        num_train_steps=15_000,
         # Again, make sure to match the model config above when extracting the freeze filter
         # that specifies which parameters should be frozen during LoRA finetuning.
         freeze_filter=pi0_fast.Pi0FASTConfig(
@@ -739,6 +743,7 @@ _CONFIGS = [
         ).get_freeze_filter(),
         # Turn off EMA for LoRA finetuning.
         ema_decay=None,
+        # wandb_enabled=False,
     ),
     TrainConfig(
         name="pi05_libero",
