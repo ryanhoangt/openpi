@@ -35,7 +35,8 @@ class Args:
         "libero_spatial"  # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
     )
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize i n sim
-    num_trials_per_task: int = 50  # Number of rollouts per task
+    num_trials_per_task: int = 10  # Number of rollouts per task
+    task_ids: str = None
 
     #################################################################################################################
     # Utils
@@ -71,10 +72,17 @@ def eval_libero(args: Args) -> None:
         raise ValueError(f"Unknown task suite: {args.task_suite_name}")
 
     client = _websocket_client_policy.WebsocketClientPolicy(args.host, args.port)
+    if args.task_ids:
+        # parse "5,6,7" → [5, 6, 7]
+        task_id_list = [int(x) for x in args.task_ids.split(",")]
+    else:
+        task_id_list = list(range(num_tasks_in_suite))
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
-    for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
+    task_results = {}  # task_id -> success_rate
+    logging.info(f"Evaluating on tasks: {task_id_list}")
+    for task_id in tqdm.tqdm(task_id_list):
         # Get task
         task = task_suite.get_task(task_id)
 
@@ -178,11 +186,20 @@ def eval_libero(args: Args) -> None:
             logging.info(f"# episodes completed so far: {total_episodes}")
             logging.info(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)")
 
+        task_success_rate = float(task_successes) / float(task_episodes)
+        task_results[task_id] = task_success_rate
         # Log final results
         logging.info(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
         logging.info(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
 
-    logging.info(f"Total success rate: {float(total_successes) / float(total_episodes)}")
+    # logging.info(f"Total success rate: {float(total_successes) / float(total_episodes)}")
+    # ==== FINAL SUMMARY ====
+    logging.info("\n================ FINAL TASK-WISE RESULTS ================")
+    for tid, rate in task_results.items():
+        logging.info(f"Task {tid}: {rate:.3f}")
+
+    overall = float(total_successes) / float(total_episodes)
+    logging.info(f"\nOverall success rate: {overall:.3f}")
     logging.info(f"Total episodes: {total_episodes}")
 
 
