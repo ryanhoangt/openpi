@@ -1,5 +1,6 @@
 from flax import nnx
 import jax
+import jax.numpy as jnp
 import pytest
 
 from openpi.models import model as _model
@@ -52,6 +53,32 @@ def test_pi0_fast_model():
 
     actions = nnx_utils.module_jit(model.sample_actions)(key, obs)
     assert actions.shape == (batch_size, 256)
+
+
+def test_pi0_fast_uncertainty():
+    key = jax.random.key(0)
+    config = pi0_fast.Pi0FASTConfig()
+    model = config.create(key)
+
+    batch_size = 2
+    obs = config.fake_obs(batch_size)
+
+    actions = nnx_utils.module_jit(model.sample_actions)(key, obs)
+    tokens, features = nnx_utils.module_jit(model.sample_actions_with_uncertainty)(key, obs)
+
+    # Collecting features must not perturb decoding.
+    assert jnp.array_equal(actions, tokens)
+    assert features.shape == (batch_size, 256, len(pi0_fast.UNCERTAINTY_FEATURE_NAMES))
+
+    # Only the emitted prefix is meaningful, and it must be finite there.
+    mask = pi0_fast.uncertainty_valid_mask(tokens)
+    assert jnp.all(jnp.isfinite(features[mask]))
+
+    cols = {name: i for i, name in enumerate(pi0_fast.UNCERTAINTY_FEATURE_NAMES)}
+    valid = features[mask]
+    assert jnp.all(valid[:, cols["entropy"]] >= 0.0)
+    assert jnp.all(valid[:, cols["neg_logp"]] >= 0.0)
+    assert jnp.all(valid[:, cols["eu"]] > 0.0)
 
 
 def test_pi0_fast_lora_model():

@@ -73,6 +73,68 @@ def put_along_last_axis(arr, indices, values):
     return jnp.where(put_mask, put_values, arr)
 
 
+# Column order of the array returned by `compute_token_uncertainty`. The first four are the
+# INSIGHT feature vector; the last two are diagnostics on the Dirichlet evidence.
+UNCERTAINTY_FEATURE_NAMES = ("entropy", "neg_logp", "au", "eu", "alpha_min", "alpha_sum")
+
+# Digamma has poles at non-positive integers, so evidence is clamped to this before use.
+MIN_EVIDENCE = 1e-6
+
+
+def compute_token_uncertainty(logit, token, *, top_k: int = 20):
+    """Uncertainty features for one decoding step.
+
+    The first four columns are the per-token feature vector of INSIGHT (arXiv:2510.01389,
+    Eq. 6): entropy of the predictive distribution, negative log-probability of the sampled
+    token, and the aleatoric/epistemic uncertainties of LogTokU (arXiv:2502.00290, Eqs. 3-5).
+
+    LogTokU uses the top-K *raw logits* directly as Dirichlet evidence parameters, which is
+    only well defined while those logits stay positive -- a condition it assumes rather than
+    enforces. The last two columns report the unclamped evidence minimum and total so that
+    assumption can be checked on a given checkpoint instead of taken on faith.
+
+    Args:
+      logit: float[B, V] logits for the current decoding step.
+      token: int[B, 1] token sampled from `logit`.
+      top_k: number of leading logits treated as evidence. LogTokU Table 3 ablates this and
+        peaks around 20-25; note that using the full vocabulary is markedly worse.
+
+    Returns:
+      float[B, 6] with columns named by `UNCERTAINTY_FEATURE_NAMES`.
+    """
+    logit = logit.astype(jnp.float32)
+    logp = jax.nn.log_softmax(logit, axis=-1)
+    entropy = -jnp.sum(jnp.exp(logp) * logp, axis=-1)
+    neg_logp = -jnp.take_along_axis(logp, token, axis=-1)[..., 0]
+
+    # Eq. 3: evidence is the raw logit, not its exponential.
+    alpha = jax.lax.top_k(logit, top_k)[0]
+    alpha_0 = jnp.sum(alpha, axis=-1, keepdims=True)
+    safe_alpha = jnp.maximum(alpha, MIN_EVIDENCE)
+    safe_alpha_0 = jnp.maximum(alpha_0, MIN_EVIDENCE)
+
+    # Eq. 4: expected entropy of the Dirichlet, over the top-K support only.
+    au = -jnp.sum(
+        (safe_alpha / safe_alpha_0)
+        * (jax.scipy.special.digamma(safe_alpha + 1) - jax.scipy.special.digamma(safe_alpha_0 + 1)),
+        axis=-1,
+    )
+    # Eq. 5: falls as total evidence accumulates.
+    eu = top_k / jnp.sum(safe_alpha + 1, axis=-1)
+
+    return jnp.stack([entropy, neg_logp, au, eu, jnp.min(alpha, axis=-1), alpha_0[..., 0]], axis=-1)
+
+
+def uncertainty_valid_mask(tokens):
+    """bool[B, T] marking the decoding steps that belong to the emitted action sequence.
+
+    Decoding runs until *every* batch element has emitted EOS, so an element that finishes
+    early keeps producing junk tokens afterwards; the loop also leaves trailing zeros when it
+    exits before the step budget. Both must be dropped before pooling over the token axis.
+    """
+    return jnp.cumsum(tokens == PALIGEMMA_EOS_TOKEN, axis=-1) == 0
+
+
 @dataclasses.dataclass(frozen=True)
 class Pi0FASTConfig(_model.BaseModelConfig):
     dtype: str = "bfloat16"
@@ -232,15 +294,27 @@ class Pi0FAST(_model.BaseModel):
         token_pplx = jnp.sum(targets * logp, axis=-1)
         return -jnp.sum(token_pplx * loss_mask, axis=-1) / jnp.clip(jnp.sum(loss_mask, -1), 1)
 
-    @override
-    def sample_actions(
+    def _decode(
         self,
         rng: at.KeyArrayLike,
         observation: _model.Observation,
         *,
         max_decoding_steps: int | at.Int[at.Array, ""] = 256,
         temperature: float = 0.0,
-    ) -> _model.Actions:
+        collect_uncertainty: bool = False,
+        uncertainty_top_k: int = 20,
+    ):
+        """Decode an action token sequence, optionally recording per-token uncertainty.
+
+        `collect_uncertainty` is a Python bool resolved at trace time, so leaving it off keeps
+        the deployment path free of the extra reductions.
+
+        Returns:
+          tokens: float[B, max_decoding_steps] decoded tokens.
+          features: float[B, max_decoding_steps, 6] as described in `compute_token_uncertainty`,
+            or a [B, 0, 6] placeholder when `collect_uncertainty` is False. Steps outside the
+            emitted sequence hold junk; mask them with `uncertainty_valid_mask(tokens)`.
+        """
         # TODO: this is a hack to get the image keys.
         observation = _model.preprocess_observation(
             None, observation, train=False, image_keys=list(observation.images.keys())
@@ -269,9 +343,13 @@ class Pi0FAST(_model.BaseModel):
         # prepare decoding -- final logit decodes the first token
         last_logit = prefix_logits[:, -1:]
         output_tokens = jnp.zeros((last_logit.shape[0], max_decoding_steps))
+        features = jnp.zeros(
+            (last_logit.shape[0], max_decoding_steps if collect_uncertainty else 0, len(UNCERTAINTY_FEATURE_NAMES)),
+            dtype=jnp.float32,
+        )
 
         def step(carry):
-            rng, last_logit, output_tokens, cache, _, step = carry
+            rng, last_logit, output_tokens, features, cache, _, step = carry
 
             # Sample token from last logit
             # Split RNG for this step
@@ -283,6 +361,11 @@ class Pi0FAST(_model.BaseModel):
                 operand=None,
             )
             output_tokens = put_along_last_axis(output_tokens, jnp.broadcast_to(step, (token.shape[0], 1)), token)
+
+            if collect_uncertainty:
+                # `last_logit` is exactly the distribution `token` was just drawn from.
+                step_features = compute_token_uncertainty(last_logit[:, 0, :], token, top_k=uncertainty_top_k)
+                features = jax.lax.dynamic_update_slice_in_dim(features, step_features[:, None, :], step, axis=1)
 
             # Check for early stopping --> stop if all batch elements have EOS token
             has_eos = jnp.any(token == PALIGEMMA_EOS_TOKEN, axis=-1)
@@ -300,14 +383,45 @@ class Pi0FAST(_model.BaseModel):
                 embedded_prefix=token_embedding, mask=mask, positions=positions, decode=True, kv_cache=cache
             )
 
-            return rng, last_logit, output_tokens, kv_cache, all_eos, step + 1
+            return rng, last_logit, output_tokens, features, kv_cache, all_eos, step + 1
 
         def cond(carry):
-            _, _, _, _, all_eos, step = carry
+            *_, all_eos, step = carry
             return (~all_eos) & (step < max_decoding_steps)
 
         # Use lax.while_loop so we can jit the full decoding loop.
-        _, _, output_tokens, _, _, _ = jax.lax.while_loop(
-            cond, step, (rng, last_logit, output_tokens, kv_cache, False, 0)
+        _, _, output_tokens, features, _, _, _ = jax.lax.while_loop(
+            cond, step, (rng, last_logit, output_tokens, features, kv_cache, False, 0)
         )
-        return output_tokens
+        return output_tokens, features
+
+    @override
+    def sample_actions(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        max_decoding_steps: int | at.Int[at.Array, ""] = 256,
+        temperature: float = 0.0,
+    ) -> _model.Actions:
+        tokens, _ = self._decode(rng, observation, max_decoding_steps=max_decoding_steps, temperature=temperature)
+        return tokens
+
+    def sample_actions_with_uncertainty(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        max_decoding_steps: int | at.Int[at.Array, ""] = 256,
+        temperature: float = 0.0,
+        uncertainty_top_k: int = 20,
+    ) -> tuple[_model.Actions, at.Array]:
+        """Like `sample_actions`, but also returns the per-token uncertainty features."""
+        return self._decode(
+            rng,
+            observation,
+            max_decoding_steps=max_decoding_steps,
+            temperature=temperature,
+            collect_uncertainty=True,
+            uncertainty_top_k=uncertainty_top_k,
+        )
