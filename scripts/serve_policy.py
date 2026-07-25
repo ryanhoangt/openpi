@@ -51,6 +51,9 @@ class Args:
     # Record the policy's behavior for debugging.
     record: bool = False
 
+    # If true, each inference result also carries per-token uncertainty features (pi0-FAST only).
+    return_uncertainty: bool = False
+
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
 
@@ -90,9 +93,14 @@ def create_policy(args: Args) -> _policy.Policy:
     match args.policy:
         case Checkpoint():
             return _policy_config.create_trained_policy(
-                _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
+                _config.get_config(args.policy.config),
+                args.policy.dir,
+                default_prompt=args.default_prompt,
+                return_token_uncertainty=args.return_uncertainty,
             )
         case Default():
+            if args.return_uncertainty:
+                raise ValueError("--return-uncertainty requires an explicit checkpoint policy (policy:checkpoint).")
             return create_default_policy(args.env, default_prompt=args.default_prompt)
 
 

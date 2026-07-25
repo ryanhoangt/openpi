@@ -710,9 +710,9 @@ _CONFIGS = [
         # you see many warnings being thrown during training.
         model=pi0_fast.Pi0FASTConfig(action_dim=7, action_horizon=10, max_token_len=180),
         data=LeRobotLiberoDataConfig(
-            # repo_id="ryanhoangt/libero-icl-finetune",
+            repo_id="ryanhoangt/libero-icl-finetune",
             # repo_id="ryanhoangt/libero-90",
-            repo_id="ryanhoangt/libero-icl-finetune-plus-90",
+            # repo_id="ryanhoangt/libero-icl-finetune-plus-90",
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=True,
         ),

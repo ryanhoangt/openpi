@@ -33,6 +33,7 @@ class Policy(BasePolicy):
         metadata: dict[str, Any] | None = None,
         pytorch_device: str = "cpu",
         is_pytorch: bool = False,
+        return_token_uncertainty: bool = False,
     ):
         """Initialize the Policy.
 
@@ -54,14 +55,23 @@ class Policy(BasePolicy):
         self._metadata = metadata or {}
         self._is_pytorch_model = is_pytorch
         self._pytorch_device = pytorch_device
+        self._return_token_uncertainty = return_token_uncertainty
 
         if self._is_pytorch_model:
+            if return_token_uncertainty:
+                raise NotImplementedError("Token uncertainty is only implemented for JAX models.")
             self._model = self._model.to(pytorch_device)
             self._model.eval()
             self._sample_actions = model.sample_actions
         else:
             # JAX model setup
             self._sample_actions = nnx_utils.module_jit(model.sample_actions)
+            if return_token_uncertainty:
+                if not hasattr(model, "sample_actions_with_uncertainty"):
+                    raise NotImplementedError(
+                        f"{type(model).__name__} does not support token uncertainty; use a pi0-FAST model."
+                    )
+                self._sample_actions_with_uncertainty = nnx_utils.module_jit(model.sample_actions_with_uncertainty)
             self._rng = rng or jax.random.key(0)
 
     @override
@@ -89,9 +99,22 @@ class Policy(BasePolicy):
 
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()
+        token_uncertainty = None
+        if self._return_token_uncertainty:
+            tokens, features = self._sample_actions_with_uncertainty(
+                sample_rng_or_pytorch_device, observation, **sample_kwargs
+            )
+            # Keep only the tokens the policy actually emitted (up to the first EOS); the rest are
+            # junk left over from decoding until every batch element stopped.
+            from openpi.models import pi0_fast as _pi0_fast
+
+            valid = np.asarray(_pi0_fast.uncertainty_valid_mask(tokens)[0])
+            token_uncertainty = np.asarray(features[0])[valid]
+        else:
+            tokens = self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)
         outputs = {
             "state": inputs["state"],
-            "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
+            "actions": tokens,
         }
         model_time = time.monotonic() - start_time
         if self._is_pytorch_model:
@@ -100,6 +123,9 @@ class Policy(BasePolicy):
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
 
         outputs = self._output_transform(outputs)
+        # Attach after the output transform so detokenization/unnormalization can't touch the features.
+        if token_uncertainty is not None:
+            outputs["token_uncertainty"] = token_uncertainty
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }
