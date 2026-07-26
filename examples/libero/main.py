@@ -1,5 +1,6 @@
 import collections
 import dataclasses
+import datetime
 import logging
 import math
 import pathlib
@@ -57,6 +58,10 @@ def eval_libero(args: Args) -> None:
     logging.info(f"Task suite: {args.task_suite_name}")
 
     pathlib.Path(args.video_out_path).mkdir(parents=True, exist_ok=True)
+    # Shared prefix for every video in this run so reruns into the same folder
+    # coexist instead of overwriting each other.
+    run_timestamp = datetime.datetime.now().strftime("%Y_%m_%d-%H_%M_%S")
+    logging.info(f"Video output root: {args.video_out_path} (run timestamp: {run_timestamp})")
 
     if args.task_suite_name == "libero_spatial":
         max_steps = 220  # longest training demo has 193 steps
@@ -172,11 +177,14 @@ def eval_libero(args: Args) -> None:
             task_episodes += 1
             total_episodes += 1
 
-            # Save a replay video of the episode
-            suffix = "success" if done else "failure"
+            # Save a replay video of the episode.
+            # Layout: <video_out_path>/<task_segment>/<ts>--episode={N:03d}--success={done}.mp4
             task_segment = task_description.replace(" ", "_")
+            task_dir = pathlib.Path(args.video_out_path) / task_segment
+            task_dir.mkdir(parents=True, exist_ok=True)
+            video_path = task_dir / f"{run_timestamp}--episode={total_episodes:03d}--success={done}.mp4"
             imageio.mimwrite(
-                pathlib.Path(args.video_out_path) / f"rollout_{task_segment}_{suffix}.mp4",
+                video_path,
                 [np.asarray(x) for x in replay_images],
                 fps=10,
             )
