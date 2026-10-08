@@ -1,5 +1,7 @@
 import collections
 import dataclasses
+import datetime
+import json
 import logging
 import math
 import pathlib
@@ -16,6 +18,14 @@ import tyro
 
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
+MAX_STEPS = {
+    "libero_spatial": 220,  # longest training demo has 193 steps
+    "libero_object": 280,  # longest training demo has 254 steps
+    "libero_goal": 300,  # longest training demo has 270 steps
+    "libero_10": 520,  # longest training demo has 505 steps
+    "libero_90": 400,  # longest training demo has 373 steps
+}
+LIBERO_PRO_PERTURBATIONS = ("lan", "object", "swap", "task", "env")
 
 
 @dataclasses.dataclass
@@ -55,20 +65,24 @@ def eval_libero(args: Args) -> None:
     num_tasks_in_suite = task_suite.n_tasks
     logging.info(f"Task suite: {args.task_suite_name}")
 
-    pathlib.Path(args.video_out_path).mkdir(parents=True, exist_ok=True)
+    # Layout: <video_out_path>/<task_id>--<task name>/<run timestamp>--episode=<init state>--success=<bool>.mp4,
+    # plus one line per episode in <video_out_path>/<run timestamp>--results.jsonl.
+    video_root = pathlib.Path(args.video_out_path)
+    video_root.mkdir(parents=True, exist_ok=True)
+    run_timestamp = datetime.datetime.now().strftime("%Y_%m_%d-%H_%M_%S")
+    results_path = video_root / f"{run_timestamp}--results.jsonl"
+    logging.info(f"Videos and results: {video_root} (run timestamp: {run_timestamp})")
 
-    if args.task_suite_name == "libero_spatial":
-        max_steps = 220  # longest training demo has 193 steps
-    elif args.task_suite_name == "libero_object":
-        max_steps = 280  # longest training demo has 254 steps
-    elif args.task_suite_name == "libero_goal":
-        max_steps = 300  # longest training demo has 270 steps
-    elif args.task_suite_name == "libero_10":
-        max_steps = 520  # longest training demo has 505 steps
-    elif args.task_suite_name == "libero_90":
-        max_steps = 400  # longest training demo has 373 steps
-    else:
+    # LIBERO-PRO suites (e.g. libero_goal_lan) perturb a base suite and keep its episode length.
+    base_suite, _, perturbation = args.task_suite_name.rpartition("_")
+    if perturbation not in LIBERO_PRO_PERTURBATIONS or base_suite not in MAX_STEPS:
+        base_suite, perturbation = args.task_suite_name, None
+    if base_suite not in MAX_STEPS:
         raise ValueError(f"Unknown task suite: {args.task_suite_name}")
+    max_steps = MAX_STEPS[base_suite]
+    # The language and task perturbations change the instruction in the BDDL file only; the other suites keep the
+    # filename-derived instruction that matches the training prompts.
+    prompt_from_bddl = perturbation in ("lan", "task")
 
     client = _websocket_client_policy.WebsocketClientPolicy(args.host, args.port)
 
@@ -82,7 +96,7 @@ def eval_libero(args: Args) -> None:
         initial_states = task_suite.get_task_init_states(task_id)
 
         # Initialize LIBERO environment and task description
-        env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed)
+        env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed, prompt_from_bddl)
 
         # Start episodes
         task_episodes, task_successes = 0, 0
@@ -164,14 +178,22 @@ def eval_libero(args: Args) -> None:
             task_episodes += 1
             total_episodes += 1
 
-            # Save a replay video of the episode
-            suffix = "success" if done else "failure"
-            task_segment = task_description.replace(" ", "_")
+            # Save a replay video of the episode. Task folders are named after the BDDL file, which is unique within a
+            # suite (prompts are not: some LIBERO-PRO suites reuse a prompt) and shared by a base suite and its
+            # perturbed versions; the episode number is the index of the initial state.
+            task_dir = video_root / f"{task_id:02d}--{task.name}"
+            task_dir.mkdir(parents=True, exist_ok=True)
             imageio.mimwrite(
-                pathlib.Path(args.video_out_path) / f"rollout_{task_segment}_{suffix}.mp4",
+                task_dir / f"{run_timestamp}--episode={episode_idx:03d}--success={done}.mp4",
                 [np.asarray(x) for x in replay_images],
                 fps=10,
             )
+            with open(results_path, "a") as f:
+                record = {
+                    "suite": args.task_suite_name, "task_id": task_id, "task": task.name, "prompt": task_description,
+                    "episode": episode_idx, "success": bool(done), "steps": max(t - args.num_steps_wait + int(done), 0),
+                }
+                f.write(json.dumps(record) + "\n")
 
             # Log current results
             logging.info(f"Success: {done}")
@@ -186,13 +208,13 @@ def eval_libero(args: Args) -> None:
     logging.info(f"Total episodes: {total_episodes}")
 
 
-def _get_libero_env(task, resolution, seed):
+def _get_libero_env(task, resolution, seed, prompt_from_bddl=False):
     """Initializes and returns the LIBERO environment, along with the task description."""
-    task_description = task.language
     task_bddl_file = pathlib.Path(get_libero_path("bddl_files")) / task.problem_folder / task.bddl_file
     env_args = {"bddl_file_name": task_bddl_file, "camera_heights": resolution, "camera_widths": resolution}
     env = OffScreenRenderEnv(**env_args)
     env.seed(seed)  # IMPORTANT: seed seems to affect object positions even when using fixed initial state
+    task_description = env.language_instruction if prompt_from_bddl else task.language
     return env, task_description
 
 
